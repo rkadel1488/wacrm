@@ -39,11 +39,11 @@ export interface SendButtonsNodeConfig {
   /** Optional header / footer lines around the buttons. */
   header_text?: string;
   footer_text?: string;
-  /** 1-3 buttons; Meta cap enforced in meta-api validation. */
+  /** 1-3 buttons; cap enforced in interactive-limits validation. */
   buttons: Array<{
-    /** Stable id sent back by Meta when this button is tapped. */
+    /** Stable id matched against the customer's text reply. */
     reply_id: string;
-    /** Visible label (≤ 20 chars per Meta). */
+    /** Visible label (≤ 20 chars). */
     title: string;
     /** node_key the runner advances to when this button is tapped. */
     next_node_key: string;
@@ -56,7 +56,7 @@ export interface SendListNodeConfig {
   button_label: string;
   header_text?: string;
   footer_text?: string;
-  /** 1-10 rows TOTAL across sections; cap enforced in meta-api. */
+  /** 1-10 rows TOTAL across sections; cap enforced in interactive-limits. */
   sections: Array<{
     title?: string;
     rows: Array<{

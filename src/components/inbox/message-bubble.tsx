@@ -60,24 +60,8 @@ function MediaImage({ url, alt }: { url: string; alt: string }) {
 
   const loadImage = useCallback(async () => {
     if (!url) return;
-
-    // Proxy URLs need auth fetch to create blob URL
-    if (url.startsWith("/api/whatsapp/media/")) {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error("Failed to load media");
-        const blob = await res.blob();
-        const blobUrl = URL.createObjectURL(blob);
-        setSrc(blobUrl);
-      } catch {
-        setError(true);
-      } finally {
-        setLoading(false);
-      }
-    } else {
-      setSrc(url);
-      setLoading(false);
-    }
+    setSrc(url);
+    setLoading(false);
   }, [url]);
 
   useEffect(() => {

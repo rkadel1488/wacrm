@@ -4,33 +4,19 @@
 // A QR code printed ahead of time (e.g. on a badge/card) encodes a
 // URL to this route. Scanning it opens the URL in the phone's
 // browser, which fires this GET and sends that one pre-mapped
-// contact a WhatsApp template message. No login, no API key — the
-// token itself (256 bits of CSPRNG, see lib/qr-triggers/tokens.ts)
+// contact a WhatsApp message via the bridge. No login, no API key —
+// the token itself (256 bits of CSPRNG, see lib/qr-triggers/tokens.ts)
 // is the only credential, and it can only ever target the single
 // contact it was minted for (migration 027).
-//
-// This is necessarily a *template* send (Meta requires an approved
-// template + a payment method on file for any business-initiated
-// message — see docs/public-api.md roadmap notes). A missing/
-// unapproved template or unconfigured WhatsApp account fails with a
-// plain-text message rather than a JSON error, since the caller here
-// is a phone browser, not an API client.
 // ============================================================
 
 import { NextResponse } from 'next/server';
 
 import { supabaseAdmin } from '@/lib/flows/admin-client';
-import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
-import { sendTemplateMessage } from '@/lib/whatsapp/meta-api';
-import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
-} from '@/lib/whatsapp/phone-utils';
+import { sendText, renderTemplateText } from '@/lib/whatsapp/bridge-api';
+import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
-import type { MessageTemplate } from '@/types';
 
 function text(body: string, status = 200) {
   return new NextResponse(body, {
@@ -129,18 +115,6 @@ export async function GET(
     return text('Something went wrong — please contact us directly.', 500);
   }
 
-  const accessToken = decrypt(config.access_token);
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }) => {
-        if (error) console.warn('[qr-trigger] access_token GCM upgrade failed:', error.message);
-      });
-  }
-
-  let templateRow: MessageTemplate | null = null;
   const { data: templateData } = await db
     .from('message_templates')
     .select('*')
@@ -148,47 +122,19 @@ export async function GET(
     .eq('name', trigger.template_name)
     .eq('language', trigger.template_language)
     .maybeSingle();
-  if (templateData && isMessageTemplate(templateData)) {
-    templateRow = templateData;
+  if (!templateData || !isMessageTemplate(templateData)) {
+    console.error(`[qr-trigger] template not found: ${trigger.template_name}`);
+    return text('Something went wrong — please contact us directly.', 500);
   }
-
-  const attempt = async (phone: string): Promise<string> => {
-    const result = await sendTemplateMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      templateName: trigger.template_name,
-      language: trigger.template_language,
-      template: templateRow ?? undefined,
-    });
-    return result.messageId;
-  };
 
   let waMessageId = '';
-  let workingPhone = sanitized;
   try {
-    const variants = phoneVariants(sanitized);
-    let lastError: unknown = null;
-    for (const variant of variants) {
-      try {
-        waMessageId = await attempt(variant);
-        workingPhone = variant;
-        lastError = null;
-        break;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (!isRecipientNotAllowedError(message)) throw err;
-        lastError = err;
-      }
-    }
-    if (lastError) throw lastError;
+    const messageText = renderTemplateText(templateData);
+    const result = await sendText({ accountId: trigger.account_id, to: sanitized, text: messageText });
+    waMessageId = result.messageId;
   } catch (err) {
-    console.error('[qr-trigger] Meta send failed:', err instanceof Error ? err.message : err);
+    console.error('[qr-trigger] bridge send failed:', err instanceof Error ? err.message : err);
     return text('Something went wrong sending your message — please contact us directly.', 502);
-  }
-
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id);
   }
 
   const conversation = await findOrCreateConversation(

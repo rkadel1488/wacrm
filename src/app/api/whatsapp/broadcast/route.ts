@@ -1,15 +1,8 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
-import { decrypt } from '@/lib/whatsapp/encryption'
-import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
+import { sendText, renderTemplateText } from '@/lib/whatsapp/bridge-api'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
-import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
-} from '@/lib/whatsapp/phone-utils'
+import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils'
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -47,15 +40,11 @@ interface BroadcastResult {
  */
 interface NewRecipient {
   phone: string
-  /** Body variable values, one per {{N}}. Legacy field. */
+  /** Body variable values, one per {{N}}. */
   params?: string[]
-  /**
-   * Structured per-send values (header text variable, media URL
-   * override, URL/COPY_CODE button values). When set, takes
-   * precedence over `params` for the body too — see
-   * sendTemplateMessage for the merge rules.
-   */
-  messageParams?: SendTimeParams
+  /** Structured per-send values; only `body` is meaningful now that
+   *  sends are plain text (no Meta header/button components). */
+  messageParams?: { body?: string[] }
 }
 
 export async function POST(request: Request) {
@@ -150,13 +139,8 @@ export async function POST(request: Request) {
       )
     }
 
-    const accessToken = decrypt(config.access_token)
-
-    // Load the template row once so sendTemplateMessage can build
-    // header + button components on each iteration. Loading inside
-    // the loop would N+1 against Supabase for every recipient.
-    // Guard against a malformed local row crashing every send in
-    // the loop with the same opaque TypeError — fail loudly once.
+    // Load the template row once for rendering, rather than re-querying
+    // per recipient.
     const { data: rawTemplateRow } = await supabase
       .from('message_templates')
       .select('*')
@@ -166,14 +150,17 @@ export async function POST(request: Request) {
       .maybeSingle()
     if (rawTemplateRow && !isMessageTemplate(rawTemplateRow)) {
       return NextResponse.json(
-        {
-          error:
-            'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before broadcasting.',
-        },
+        { error: 'Template row is malformed locally.' },
         { status: 500 },
       )
     }
     const templateRow = rawTemplateRow ?? null
+    if (!templateRow) {
+      return NextResponse.json(
+        { error: `Template "${template_name}" not found` },
+        { status: 404 },
+      )
+    }
 
     const results: BroadcastResult[] = []
     let sentCount = 0
@@ -192,37 +179,18 @@ export async function POST(request: Request) {
         continue
       }
 
-      // Retry with phone variants on "not in allowed list" so numbers
-      // that differ only in a trunk-prefix 0 still reach recipients.
-      const variants = phoneVariants(sanitized)
       let sentMessageId: string | null = null
       let lastError: string | null = null
 
-      for (const variant of variants) {
-        try {
-          const result = await sendTemplateMessage({
-            phoneNumberId: config.phone_number_id,
-            accessToken,
-            to: variant,
-            templateName: template_name,
-            language: template_language || 'en_US',
-            template: templateRow ?? undefined,
-            messageParams: recipient.messageParams,
-            params: recipient.params ?? [],
-          })
-          sentMessageId = result.messageId
-          lastError = null
-          break
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : 'Unknown error'
-          if (!isRecipientNotAllowedError(errorMessage)) {
-            lastError = errorMessage
-            break
-          }
-          lastError = errorMessage
-          // retry with next variant
-        }
+      try {
+        const text = renderTemplateText(
+          templateRow,
+          recipient.messageParams?.body ?? recipient.params ?? [],
+        )
+        const result = await sendText({ accountId, to: sanitized, text })
+        sentMessageId = result.messageId
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : 'Unknown error'
       }
 
       if (sentMessageId) {

@@ -12,18 +12,18 @@
  *   2. Graph integrity — entry node exists, all next_node_key
  *      references resolve, no unreachable nodes, non-terminal nodes
  *      have an outgoing edge.
- *   3. Meta API limits — button title ≤20 chars, ≤3 buttons per
- *      send_buttons, ≤10 list rows total, ≤24 chars per list row
+ *   3. Interactive-prompt limits — button title ≤20 chars, ≤3 buttons
+ *      per send_buttons, ≤10 list rows total, ≤24 chars per list row
  *      title. Mirrors the runtime checks inside
- *      `src/lib/whatsapp/meta-api.ts` so save-time and send-time
- *      can never disagree.
+ *      `src/lib/whatsapp/interactive-limits.ts` so save-time and
+ *      send-time can never disagree.
  *
  * Issues carry enough field info that the builder can highlight the
  * exact input that triggered them. Node-scoped issues include
  * `node_key`; trigger-scoped use `scope: 'trigger'`.
  */
 
-import { INTERACTIVE_LIMITS } from "@/lib/whatsapp/meta-api";
+import { INTERACTIVE_LIMITS } from "@/lib/whatsapp/interactive-limits";
 
 export interface ValidationIssue {
   severity: "error" | "warning";

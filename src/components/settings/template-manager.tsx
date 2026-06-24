@@ -6,11 +6,9 @@ import {
   Plus,
   Trash2,
   Loader2,
-  RefreshCw,
   AlertCircle,
   X,
   Pencil,
-  RotateCcw,
   Upload,
 } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
@@ -131,7 +129,6 @@ export function TemplateManager() {
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [syncing, setSyncing] = useState(false);
   const [form, setForm] = useState<TemplateFormData>(emptyForm);
   // Non-null when the dialog is editing an existing row — switches the
   // submit handler from POST /submit to PATCH /[id] and changes the
@@ -140,12 +137,11 @@ export function TemplateManager() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   // Template selected for the confirm-delete dialog. The destructive
   // action goes through this two-step so a slip on the trash icon
-  // doesn't take the template off Meta as well as locally.
+  // doesn't delete a template by accident.
   const [templateToDelete, setTemplateToDelete] =
     useState<MessageTemplate | null>(null);
   // Header-image upload (issue #230). Uploads to the account-scoped
-  // chat-media bucket and stores the public URL in header_media_url; the
-  // submit route turns that into a Meta Resumable-Upload handle.
+  // chat-media bucket and stores the public URL in header_media_url.
   const [uploadingHeader, setUploadingHeader] = useState(false);
   const headerFileRef = useRef<HTMLInputElement>(null);
 
@@ -279,15 +275,7 @@ export function TemplateManager() {
       // Refresh first, then close — re-opening the dialog
       // immediately should not show a stale list.
       if (user) await fetchTemplates(user.id);
-      toast.success(
-        data.dry_run
-          ? isEdit
-            ? 'Template updated (dry-run — no Meta call)'
-            : 'Template saved (dry-run — no Meta call)'
-          : isEdit
-            ? 'Edit submitted — Meta typically reviews within 24 hours.'
-            : 'Submitted to Meta — typical review time is 24 hours. Status updates automatically.',
-      );
+      toast.success(isEdit ? 'Template updated.' : 'Template saved.');
       setDialogOpen(false);
       setForm(emptyForm);
       setEditingId(null);
@@ -299,56 +287,11 @@ export function TemplateManager() {
     }
   }
 
-  async function handleSyncFromMeta() {
-    if (!user) return;
-    setSyncing(true);
-    try {
-      const res = await fetch('/api/whatsapp/templates/sync', { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || `Sync failed (HTTP ${res.status})`);
-      }
-      toast.success(
-        `Synced ${data.total} template${data.total === 1 ? '' : 's'} from Meta` +
-          (data.inserted || data.updated
-            ? ` (${data.inserted} new, ${data.updated} updated)`
-            : ''),
-      );
-      if (Array.isArray(data.errors) && data.errors.length > 0) {
-        const preview = data.errors.slice(0, 3).map(
-          (e: { name: string; language: string; message: string }) =>
-            `${e.name} (${e.language})`,
-        );
-        const suffix =
-          data.errors.length > 3 ? `, +${data.errors.length - 3} more` : '';
-        toast.error(`Failed to sync: ${preview.join(', ')}${suffix}`);
-      }
-      if (data.truncated) {
-        // Use error (not warning) so the message survives long
-        // enough to read — sonner's `warning` auto-dismisses on
-        // the same short timer as `success`.
-        toast.error(
-          'Synced the first 2000 templates only — your account has more. Sync again to continue, or contact support if this persists.',
-          { duration: 10000 },
-        );
-      }
-      await fetchTemplates(user.id);
-    } catch (err) {
-      console.error('Template sync error:', err);
-      toast.error(err instanceof Error ? err.message : 'Failed to sync templates');
-    } finally {
-      setSyncing(false);
-    }
-  }
-
   async function confirmDelete() {
     const target = templateToDelete;
     if (!target || deletingId) return;
     setDeletingId(target.id);
     try {
-      // Route handler scopes the Meta delete via hsm_id (so sibling
-      // language variants survive) and falls through to remove the
-      // local row. Local-only rows skip the Meta call.
       const res = await fetch(`/api/whatsapp/templates/${target.id}`, {
         method: 'DELETE',
       });
@@ -463,7 +406,7 @@ export function TemplateManager() {
     }
     if (file.size > MEDIA_MAX_BYTES_BY_KIND.image) {
       toast.error(
-        `Image is ${(file.size / 1024 / 1024).toFixed(1)} MB — Meta's limit is 5 MB.`,
+        `Image is ${(file.size / 1024 / 1024).toFixed(1)} MB — the limit is 5 MB.`,
       );
       return;
     }
@@ -483,20 +426,9 @@ export function TemplateManager() {
     <section className="animate-in fade-in-50 space-y-4 duration-200">
       <SettingsPanelHead
         title="Message templates"
-        description={
-          'Create templates and submit them to Meta for approval. Use "Sync from Meta" to pull templates approved elsewhere.'
-        }
+        description="Create reusable saved messages with {{n}} placeholders for broadcasts and the inbox."
         action={
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              onClick={handleSyncFromMeta}
-              disabled={syncing}
-              title="Pull approved templates from your Meta WhatsApp Business Account"
-            >
-              <RefreshCw className={`size-4 ${syncing ? 'animate-spin' : ''}`} />
-              {syncing ? 'Syncing…' : 'Sync from Meta'}
-            </Button>
             <Button onClick={openCreate}>
               <Plus className="size-4" />
               New Template
@@ -538,20 +470,6 @@ export function TemplateManager() {
                           {template.language}
                         </span>
                       )}
-                      {template.quality_score && (
-                        <span
-                          className={`text-[10px] uppercase font-medium ${
-                            template.quality_score === 'GREEN'
-                              ? 'text-emerald-400'
-                              : template.quality_score === 'YELLOW'
-                                ? 'text-yellow-400'
-                                : 'text-red-400'
-                          }`}
-                          title="Meta quality score"
-                        >
-                          {template.quality_score}
-                        </span>
-                      )}
                     </div>
                     <p className="text-sm text-muted-foreground line-clamp-2">
                       {template.body_text}
@@ -561,57 +479,25 @@ export function TemplateManager() {
                         {template.footer_text}
                       </p>
                     )}
-                    {(template.rejection_reason || template.submission_error) && (
-                      <div className="flex items-start gap-1.5 text-xs text-red-400 bg-red-950/20 border border-red-900/40 rounded px-2 py-1.5">
-                        <AlertCircle className="size-3.5 mt-0.5 shrink-0" />
-                        <span>
-                          {template.rejection_reason || template.submission_error}
-                        </span>
-                      </div>
-                    )}
                   </div>
                   <div className="flex items-center gap-1 shrink-0 ml-2">
-                    {statusKey === 'APPROVED' && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => openEdit(template)}
-                        title="Editing triggers Meta re-review — status flips to PENDING."
-                        aria-label="Edit template"
-                        className="text-muted-foreground hover:text-primary hover:bg-primary/10 h-8 px-2"
-                      >
-                        <Pencil className="size-3.5" />
-                        Edit
-                      </Button>
-                    )}
-                    {(statusKey === 'REJECTED' || statusKey === 'PAUSED') && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => openEdit(template)}
-                        title="Edit the template and resubmit to Meta for review."
-                        aria-label="Edit and resubmit template"
-                        className="text-muted-foreground hover:text-primary hover:bg-primary/10 h-8 px-2"
-                      >
-                        <RotateCcw className="size-3.5" />
-                        Resubmit
-                      </Button>
-                    )}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => openEdit(template)}
+                      aria-label="Edit template"
+                      className="text-muted-foreground hover:text-primary hover:bg-primary/10 h-8 px-2"
+                    >
+                      <Pencil className="size-3.5" />
+                      Edit
+                    </Button>
                     <Button
                       variant="ghost"
                       size="icon"
                       onClick={() => setTemplateToDelete(template)}
                       disabled={deletingId === template.id}
-                      aria-label={
-                        template.meta_template_id
-                          ? 'Delete template from Meta and locally'
-                          : 'Delete template locally'
-                      }
-                      title={
-                        template.meta_template_id
-                          ? 'Delete from Meta and locally'
-                          : 'Delete locally'
-                      }
+                      aria-label="Delete template"
+                      title="Delete"
                       className="text-muted-foreground hover:text-red-400 hover:bg-red-950/30 h-8 w-8"
                     >
                       {deletingId === template.id ? (
@@ -645,8 +531,8 @@ export function TemplateManager() {
             </DialogTitle>
             <DialogDescription className="text-muted-foreground">
               {editingId
-                ? 'Save your changes to re-submit to Meta. Status will flip back to PENDING during review.'
-                : 'Build a template and submit it to Meta for approval. Once approved, you can use it in broadcasts and the inbox.'}
+                ? 'Save your changes to this saved message.'
+                : 'Build a saved message you can reuse in broadcasts and the inbox.'}
             </DialogDescription>
           </DialogHeader>
 
@@ -654,10 +540,8 @@ export function TemplateManager() {
             <div className="flex items-start gap-2 rounded border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
               <AlertCircle className="size-4 mt-0.5 shrink-0" />
               <p>
-                AUTHENTICATION templates have a fixed body + OTP button shape
-                that needs a different builder. Create them in Meta WhatsApp
-                Manager for now and use <strong>Sync from Meta</strong> to
-                bring them in.
+                AUTHENTICATION templates require a fixed body + OTP button
+                shape that isn&apos;t supported by this builder.
               </p>
             </div>
           )}
@@ -674,7 +558,7 @@ export function TemplateManager() {
               />
               <p className="text-[11px] text-muted-foreground">
                 {editingId
-                  ? 'Name is fixed once a template exists on Meta — create a new template to change it.'
+                  ? 'Name is fixed once a template is created — create a new template to change it.'
                   : 'Lowercase letters, digits, and underscores only.'}
               </p>
             </div>
@@ -727,11 +611,11 @@ export function TemplateManager() {
                 </datalist>
                 <p className="text-[11px] text-muted-foreground">
                   {editingId
-                    ? 'Language is fixed once a template exists on Meta.'
+                    ? 'Language is fixed once a template is created.'
                     : (
                         <>
-                          Must match the exact code on Meta — <code>en_US</code>{' '}
-                          and <code>en</code> are distinct.
+                          <code>en_US</code> and <code>en</code> are treated
+                          as distinct codes.
                         </>
                       )}
                 </p>
@@ -790,7 +674,7 @@ export function TemplateManager() {
                     <Input
                       id="template-header-sample"
                       aria-label="Sample value for header variable"
-                      placeholder="Sample value for {{1}} (required for Meta review)"
+                      placeholder="Sample value for {{1}}"
                       value={form.header_sample}
                       onChange={(e) =>
                         setForm({ ...form, header_sample: e.target.value })
@@ -853,8 +737,8 @@ export function TemplateManager() {
                   )}
                   <p className="text-[11px] text-muted-foreground leading-relaxed">
                     {form.header_format === 'image'
-                      ? 'Upload a JPEG/PNG (≤5 MB, ≥800×418 px recommended) or paste a public HTTPS link — we upload it to Meta for review automatically.'
-                      : 'Must be a publicly accessible HTTPS link. Meta fetches it once during review, so it needs to stay live for ~24 hrs.'}
+                      ? 'Upload a JPEG/PNG (≤5 MB, ≥800×418 px recommended) or paste a public HTTPS link.'
+                      : 'Must be a publicly accessible HTTPS link.'}
                     {form.header_format === 'video' &&
                       ' Recommended: MP4 / 3GPP, ≤16 MB, ≤60 seconds.'}
                     {form.header_format === 'document' &&
@@ -884,7 +768,7 @@ export function TemplateManager() {
               {bodyVarCount > 0 && (
                 <div className="space-y-1.5 pt-1">
                   <Label className="text-[11px] text-muted-foreground">
-                    Sample values (Meta uses these to review your template)
+                    Sample values (optional, shown when editing)
                   </Label>
                   {form.body_samples.map((val, i) => {
                     const inputId = `template-body-sample-${i}`;
@@ -1073,21 +957,18 @@ export function TemplateManager() {
               {submitting ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  {editingId ? 'Saving…' : 'Submitting…'}
+                  {editingId ? 'Saving…' : 'Creating…'}
                 </>
               ) : editingId ? (
-                'Save & Resubmit'
+                'Save Changes'
               ) : (
-                'Submit for Approval'
+                'Create Template'
               )}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* Confirm-delete dialog. Surfacing the meta_template_id case
-          separately so users understand a real Meta delete is happening,
-          not just a local cleanup. */}
       <Dialog
         open={templateToDelete !== null}
         onOpenChange={(open) => {
@@ -1098,9 +979,7 @@ export function TemplateManager() {
           <DialogHeader>
             <DialogTitle className="text-popover-foreground">Delete template?</DialogTitle>
             <DialogDescription className="text-muted-foreground">
-              {templateToDelete?.meta_template_id
-                ? `"${templateToDelete?.name}" will be deleted from Meta and from wacrm. Active broadcasts using this template will start failing on their next send. This can't be undone.`
-                : `"${templateToDelete?.name}" will be deleted from wacrm. It was never submitted to Meta, so no remote cleanup is needed.`}
+              {`"${templateToDelete?.name}" will be deleted from wacrm. Active broadcasts using this template will start failing on their next send. This can't be undone.`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="bg-popover border-border">

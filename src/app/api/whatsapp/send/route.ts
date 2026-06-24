@@ -1,19 +1,13 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import {
-  sendTextMessage,
-  sendTemplateMessage,
-  sendMediaMessage,
-  type MediaKind,
-} from '@/lib/whatsapp/meta-api'
-import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
+  sendText,
+  sendMedia,
+  renderTemplateText,
+  type BridgeMediaKind,
+} from '@/lib/whatsapp/bridge-api'
 import { supabaseAdmin } from '@/lib/flows/admin-client'
-import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
-} from '@/lib/whatsapp/phone-utils'
+import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils'
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -68,7 +62,6 @@ export async function POST(request: Request) {
       message_type,
       content_text,
       media_url,
-      filename,
       template_name,
       template_language,
       template_params,
@@ -83,8 +76,8 @@ export async function POST(request: Request) {
       )
     }
 
-    // Media kinds (image/video/document/audio) are sent to Meta via a
-    // public URL the composer already uploaded to the chat-media bucket.
+    // Media kinds (image/video/document/audio) are sent via a public URL
+    // the composer already uploaded to the chat-media bucket.
     const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const
     const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(message_type)
 
@@ -119,8 +112,8 @@ export async function POST(request: Request) {
       )
     }
 
-    // Meta caps media captions at 1024 chars; reject before the upload is
-    // wasted at the Meta call. (Audio carries no caption — see meta-api.)
+    // Cap media captions at 1024 chars, matching WhatsApp's own limit;
+    // reject before the upload is wasted.
     if (
       isMediaKind &&
       message_type !== 'audio' &&
@@ -165,7 +158,6 @@ export async function POST(request: Request) {
       )
     }
 
-    // Fetch and decrypt WhatsApp config
     const { data: config, error: configError } = await supabase
       .from('whatsapp_config')
       .select('*')
@@ -179,77 +171,7 @@ export async function POST(request: Request) {
       )
     }
 
-    const accessToken = decrypt(config.access_token)
-
-    // Self-heal legacy CBC-encrypted tokens. Fire-and-forget: we
-    // return from the send without waiting, so a failed upgrade just
-    // means the next send tries again. The upgrade is idempotent —
-    // concurrent sends both produce valid GCM ciphertexts of the same
-    // plaintext, last write wins.
-    if (isLegacyFormat(config.access_token)) {
-      void supabase
-        .from('whatsapp_config')
-        .update({ access_token: encrypt(accessToken) })
-        .eq('id', config.id)
-        .then(({ error }) => {
-          if (error) {
-            console.warn(
-              '[whatsapp/send] access_token GCM upgrade failed:',
-              error.message,
-            )
-          }
-        })
-    }
-
-    // Resolve the reply target (if any) to its Meta message_id, which is
-    // what `context.message_id` on the outgoing Meta payload needs. The
-    // parent must belong to this same conversation — otherwise a caller
-    // could quote messages they can't see by guessing UUIDs.
-    let contextMessageId: string | undefined
-    if (reply_to_message_id) {
-      const { data: parent, error: parentError } = await supabase
-        .from('messages')
-        .select('message_id, conversation_id')
-        .eq('id', reply_to_message_id)
-        .eq('conversation_id', conversation_id)
-        .maybeSingle()
-
-      if (parentError || !parent) {
-        return NextResponse.json(
-          { error: 'reply_to_message_id not found in this conversation' },
-          { status: 400 }
-        )
-      }
-      if (!parent.message_id) {
-        // Parent never reached Meta (still in 'sending' or 'failed') — we
-        // can't quote it on WhatsApp. Send without context rather than
-        // dropping the message entirely.
-        console.warn(
-          '[whatsapp/send] reply target has no Meta message_id; sending without context'
-        )
-      } else {
-        contextMessageId = parent.message_id
-      }
-    }
-
-    // Send via Meta API — retry with phone-number variants if Meta rejects
-    // with "recipient not in allowed list" (common in sandbox / when a
-    // number was registered with/without a trunk 0). If an alternate
-    // format succeeds, we persist it back to the contact row so the
-    // next send goes through on the first attempt.
-    let waMessageId = ''
-    let workingPhone = sanitizedPhone
-
-    // For template sends, load the row so sendTemplateMessage can
-    // build header + button components from the template definition.
-    // Match on (user_id, name, language) — same triple the unique
-    // index enforces — so multi-language templates work correctly.
-    // Missing template falls through with `templateRow = null` and
-    // the legacy body-only path runs.
-    // Load the template row so sendTemplateMessage can build header
-    // + button components from the definition. isMessageTemplate
-    // guards against a malformed row (e.g. from a partial sync)
-    // crashing the send-builder later in the stack.
+    // Load the template row for plain-text variable substitution.
     let templateRow: MessageTemplate | null = null
     if (message_type === 'template' && template_name) {
       const { data } = await supabase
@@ -261,103 +183,46 @@ export async function POST(request: Request) {
         .maybeSingle()
       if (data && !isMessageTemplate(data)) {
         return NextResponse.json(
-          {
-            error:
-              'Template row is malformed locally — run "Sync from Meta" in Settings to repair it.',
-          },
+          { error: 'Template row is malformed locally.' },
           { status: 500 },
         )
       }
       templateRow = data ?? null
     }
 
-    const attempt = async (phone: string): Promise<string> => {
-      if (message_type === 'template') {
-        const result = await sendTemplateMessage({
-          phoneNumberId: config.phone_number_id,
-          accessToken,
-          to: phone,
-          templateName: template_name,
-          language: template_language || 'en_US',
-          template: templateRow ?? undefined,
-          messageParams: template_message_params ?? undefined,
-          // Legacy body-only fallback — only consulted when
-          // messageParams.body isn't set.
-          params: template_params || [],
-          contextMessageId,
-        })
-        return result.messageId
-      }
-      if (isMediaKind) {
-        // content_text doubles as the caption (ignored for audio inside
-        // sendMediaMessage). filename surfaces in the recipient's chat
-        // for documents only.
-        const result = await sendMediaMessage({
-          phoneNumberId: config.phone_number_id,
-          accessToken,
-          to: phone,
-          kind: message_type as MediaKind,
-          link: media_url,
-          caption: content_text || undefined,
-          filename: filename || undefined,
-          contextMessageId,
-        })
-        return result.messageId
-      }
-      const result = await sendTextMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        text: content_text,
-        contextMessageId,
-      })
-      return result.messageId
-    }
+    let waMessageId = ''
 
     try {
-      const variants = phoneVariants(sanitizedPhone)
-      let lastError: unknown = null
-
-      for (const variant of variants) {
-        try {
-          waMessageId = await attempt(variant)
-          workingPhone = variant
-          lastError = null
-          break
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err)
-          // Only retry when the failure is specifically that the
-          // recipient isn't in Meta's allowed list. Any other error
-          // (bad token, invalid template, etc.) bubbles up immediately.
-          if (!isRecipientNotAllowedError(message)) {
-            throw err
-          }
-          lastError = err
-          console.warn(`[whatsapp/send] variant "${variant}" rejected by Meta, trying next…`)
+      if (message_type === 'template') {
+        if (!templateRow) {
+          return NextResponse.json({ error: `Template "${template_name}" not found` }, { status: 404 })
         }
+        const text = renderTemplateText(
+          templateRow,
+          template_message_params?.body ?? template_params ?? [],
+        )
+        const result = await sendText({ accountId, to: sanitizedPhone, text })
+        waMessageId = result.messageId
+      } else if (isMediaKind) {
+        const result = await sendMedia({
+          accountId,
+          to: sanitizedPhone,
+          mediaUrl: media_url,
+          mediaType: message_type as BridgeMediaKind,
+          caption: content_text || undefined,
+        })
+        waMessageId = result.messageId
+      } else {
+        const result = await sendText({ accountId, to: sanitizedPhone, text: content_text })
+        waMessageId = result.messageId
       }
-
-      if (lastError) throw lastError
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown Meta API error'
-      console.error('Meta API send failed for all variants:', message)
+      const message = err instanceof Error ? err.message : 'Unknown bridge error'
+      console.error('Bridge send failed:', message)
       return NextResponse.json(
-        { error: `Meta API error: ${message}` },
+        { error: `WhatsApp send failed: ${message}` },
         { status: 502 }
       )
-    }
-
-    // If a non-original variant succeeded, update the contact so future
-    // sends go straight through. sanitizePhoneForMeta on workingPhone
-    // will yield workingPhone itself, so re-storing preserves it.
-    if (workingPhone !== sanitizedPhone) {
-      console.log(
-        `[whatsapp/send] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
-      )
-      await supabase
-        .from('contacts')
-        .update({ phone: workingPhone })
-        .eq('id', contact.id)
     }
 
     // Insert message into DB — field names MUST match the messages schema
@@ -383,7 +248,7 @@ export async function POST(request: Request) {
     if (msgError) {
       console.error('Error inserting sent message:', msgError)
       return NextResponse.json(
-        { error: `Message sent to Meta but failed to save to DB: ${msgError.message}` },
+        { error: `Message sent but failed to save to DB: ${msgError.message}` },
         { status: 500 }
       )
     }
@@ -417,7 +282,7 @@ export async function POST(request: Request) {
         .eq('status', 'active')
       if (pauseErr) {
         // Best-effort — log + continue. The agent's message already
-        // landed at Meta; don't fail the response over a bookkeeping
+        // went out; don't fail the response over a bookkeeping
         // miss. Worst case: a stale active run gets caught by the
         // stale-run cron sweep within 24h.
         console.error('[flows] pause-on-agent-send failed:', pauseErr.message)
