@@ -148,6 +148,13 @@ export const RATE_LIMITS = {
    *  instance deploy needs the Redis swap described at the top of
    *  this file (the per-key call sites don't change). */
   publicApi: { limit: 120, windowMs: 60_000 },
+  /** Public QR-trigger endpoint, keyed per source IP. Generous enough
+   *  that a flaky connection retrying a scan isn't blocked, tight
+   *  enough that scripted enumeration of QR tokens can't fan out. The
+   *  per-token cooldown (qr_triggers.cooldown_seconds) is the real
+   *  anti-spam control; this is belt-and-braces against one IP
+   *  hammering many tokens. */
+  qrTrigger: { limit: 20, windowMs: 60_000 },
 } as const;
 
 /** Test-only helper. Clears the in-memory state so unit tests don't
